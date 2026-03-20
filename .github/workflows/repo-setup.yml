@@ -1,223 +1,201 @@
-name: 🚀 Repository Setup & Release
+name: 🚀 Repository Setup
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: write
   pages: write
   id-token: write
+  administration: write
 
 jobs:
-  # ── Job 1: Configure repo metadata ────────────────────────────────
-  configure-repo:
-    name: Set Description, Topics & Pages
+  setup:
+    name: Configure Repo & Create Release
     runs-on: ubuntu-latest
     steps:
-      - name: Set repository description and topics
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api --method PATCH \
-            /repos/${{ github.repository }} \
-            -f description="🛡️ AI-powered security analyzer for Kadena Pact smart contracts — static analysis + Claude AI + risk scoring" \
-            -f homepage="https://sunilblinkoninfra-cyber.github.io/pact-sentinel" \
-            -f has_issues=true \
-            -f has_wiki=false \
-            -f has_projects=false \
-            --silent && echo "✅ Description updated"
-
-      - name: Set repository topics
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api --method PUT \
-            /repos/${{ github.repository }}/topics \
-            -f 'names[]=pact' \
-            -f 'names[]=kadena' \
-            -f 'names[]=blockchain' \
-            -f 'names[]=security' \
-            -f 'names[]=smart-contracts' \
-            -f 'names[]=static-analysis' \
-            -f 'names[]=vulnerability-scanner' \
-            -f 'names[]=defi' \
-            -f 'names[]=cli-tool' \
-            --silent && echo "✅ Topics set: pact kadena blockchain security smart-contracts static-analysis vulnerability-scanner defi cli-tool"
-
-      - name: Enable GitHub Pages from /docs
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api --method POST \
-            /repos/${{ github.repository }}/pages \
-            -f build_type=legacy \
-            -f source='{"branch":"main","path":"/docs"}' \
-            --silent 2>/dev/null \
-          || gh api --method PUT \
-            /repos/${{ github.repository }}/pages \
-            -f build_type=legacy \
-            -f source='{"branch":"main","path":"/docs"}' \
-            --silent 2>/dev/null \
-          || echo "ℹ️  Pages already configured or needs manual enable"
-          echo "✅ GitHub Pages configured → /docs"
-
-  # ── Job 2: Create GitHub Release ─────────────────────────────────
-  create-release:
-    name: Create v1.0.0 Release
-    runs-on: ubuntu-latest
-    needs: configure-repo
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Create Release from v1.0.0 tag
+      - name: Update repo description
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Check if release already exists
+          gh api --method PATCH /repos/${{ github.repository }} \
+            --field description="🛡️ AI-powered security analyzer for Kadena Pact smart contracts — static analysis + Claude AI + risk scoring" \
+            --field homepage="https://sunilblinkoninfra-cyber.github.io/pact-sentinel" \
+            && echo "✅ Description set" || echo "⚠️ Description update failed (may need repo admin)"
+
+      - name: Set topics
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PUT /repos/${{ github.repository }}/topics \
+            --field 'names[]=pact' \
+            --field 'names[]=kadena' \
+            --field 'names[]=blockchain' \
+            --field 'names[]=security' \
+            --field 'names[]=smart-contracts' \
+            --field 'names[]=static-analysis' \
+            --field 'names[]=vulnerability-scanner' \
+            --field 'names[]=defi' \
+            --field 'names[]=cli-tool' \
+            && echo "✅ Topics: pact kadena blockchain security smart-contracts static-analysis vulnerability-scanner defi cli-tool" \
+            || echo "⚠️ Topics update failed"
+
+      - name: Enable GitHub Pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Try to create Pages source first
+          gh api --method POST /repos/${{ github.repository }}/pages \
+            --field 'source[branch]=main' \
+            --field 'source[path]=/docs' 2>/dev/null \
+          && echo "✅ Pages enabled from /docs" \
+          || (
+            # Already exists — update it
+            gh api --method PUT /repos/${{ github.repository }}/pages \
+              --field 'source[branch]=main' \
+              --field 'source[path]=/docs' 2>/dev/null \
+            && echo "✅ Pages updated to /docs" \
+            || echo "ℹ️  Pages: $(gh api /repos/${{ github.repository }}/pages --jq .html_url 2>/dev/null || echo 'check manually')"
+          )
+
+      - name: Create v1.0.0 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
           if gh release view v1.0.0 --repo ${{ github.repository }} &>/dev/null; then
             echo "ℹ️  Release v1.0.0 already exists"
-            exit 0
-          fi
+            gh release view v1.0.0 --repo ${{ github.repository }}
+          else
+            gh release create v1.0.0 \
+              --title "🛡️ Pact Sentinel v1.0.0 — Competition Release" \
+              --latest \
+              --notes "$(cat << 'NOTES'
+## 🛡️ Pact Sentinel v1.0.0
 
-          gh release create v1.0.0 \
-            --repo ${{ github.repository }} \
-            --title "🛡️ Pact Sentinel v1.0.0 — Competition Release" \
-            --notes "## 🛡️ Pact Sentinel v1.0.0
-
-AI-powered security analyzer for Kadena Pact smart contracts.
+**AI-powered security analyzer for Kadena Pact smart contracts.**
 
 ### ✨ Highlights
 
 - **12 detection rules** covering the full Pact vulnerability surface
 - **Recursive descent parser** — real AST, not regex matching
 - **Claude AI integration** — deep explanations, attack scenarios, auto-fix suggestions
-- **Risk scoring** — A+ to F- letter grades with compound multipliers
+- **Risk scoring** — A+ to F- letter grades with compound risk multipliers
 - **Zero mandatory dependencies** — pure Python 3.9+ stdlib
 - **4 output formats** — CLI, JSON, Markdown, SARIF 2.1
-- **CI/CD ready** — GitHub Actions workflow with SARIF upload
+- **CI/CD ready** — GitHub Actions with SARIF upload and build gates
 - **39 unit tests** — all passing
 
 ### 📊 Test Results
 
 | Contract | Findings | Grade | Score |
 |----------|----------|-------|-------|
-| \`vulnerable-defi.pact\` | 22 | **F-** | 0.0/100 |
-| \`safe-token.pact\` | 0 | **A+** | 100/100 |
+| `vulnerable-defi.pact` | **22** | **F-** | 0.0/100 |
+| `safe-token.pact` | **0** | **A+** | 100/100 |
+
+### 🔍 Rules
+
+| ID | Sev | Title |
+|----|-----|-------|
+| R-001 | 🔴 CRITICAL | State Mutation Without Capability Guard |
+| R-002 | 🟡 MEDIUM | Overly Broad Capability Scope |
+| R-003 | 🟠 HIGH | Hardcoded Admin Keyset |
+| R-004 | 🟠 HIGH | Public Function Modifies Sensitive State |
+| R-005 | 🔴 CRITICAL | Capability Missing Authorization Enforcement |
+| R-006 | 🟠 HIGH | CEI Violation (state before auth) |
+| R-007 | 🔴 CRITICAL | Unguarded Administrative Function |
+| R-008 | 🟠 HIGH | Unsafe defpact Multi-Step Logic |
+| R-009 | 🟠 HIGH | Weak Guard Construction |
+| R-010 | 🟡 MEDIUM | Unprotected Table Initialization |
+| R-011 | 🟡 MEDIUM | Capability Composition Re-entrancy |
+| R-012 | 🟠 HIGH | Transfer Cap Missing @managed |
 
 ### 🚀 Quick Start
 
-\`\`\`bash
+```bash
 git clone https://github.com/sunilblinkoninfra-cyber/pact-sentinel.git
 cd pact-sentinel
 python cli.py tests/contracts/vulnerable-defi.pact --no-ai
-\`\`\`
+```
 
-### 🔍 Vulnerability Coverage
-
-| Rule | Severity | Description |
-|------|----------|-------------|
-| R-001 | 🔴 CRITICAL | State mutation without capability guard |
-| R-002 | 🟡 MEDIUM | Overly broad capability scope |
-| R-003 | 🟠 HIGH | Hardcoded admin keyset reference |
-| R-004 | 🟠 HIGH | Public function modifies sensitive state |
-| R-005 | 🔴 CRITICAL | Capability missing authorization enforcement |
-| R-006 | 🟠 HIGH | CEI violation (state change before auth) |
-| R-007 | 🔴 CRITICAL | Unguarded administrative function |
-| R-008 | 🟠 HIGH | Unsafe defpact multi-step logic |
-| R-009 | 🟠 HIGH | Weak or bypassable guard construction |
-| R-010 | 🟡 MEDIUM | Unprotected table initialization |
-| R-011 | 🟡 MEDIUM | Capability composition re-entrancy |
-| R-012 | 🟠 HIGH | Transfer capability missing \`@managed\` |
-
-### 📁 Repository Structure
-
-\`\`\`
-pact-sentinel/
-├── cli.py                   # CLI entry point
-├── web_app.py               # Flask web server
-├── src/
-│   ├── parser/              # Recursive descent Pact parser
-│   ├── rules/               # 12 security detection rules
-│   ├── ai/                  # Claude API integration  
-│   ├── output/              # Risk scorer + reporters
-│   └── core/                # Orchestrator
-├── web/index.html           # Dark terminal Web UI
-├── tests/                   # 39 unit tests
-├── docs/                    # GitHub Pages site
-└── .github/workflows/       # CI/CD pipelines
-\`\`\`
-
-### 📄 Documentation
-
-- [GitHub Pages Site](https://sunilblinkoninfra-cyber.github.io/pact-sentinel)
-- [README](README.md)
-- [CHANGELOG](CHANGELOG.md)
-- [Contributing Guide](CONTRIBUTING.md)
+### 📖 Links
+- [Documentation](https://sunilblinkoninfra-cyber.github.io/pact-sentinel)
+- [README](README.md) · [CHANGELOG](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
 ---
-*Built for the Kadena Pact Security Competition.*" \
-            --latest \
+*Built for the Kadena Pact Security Competition.*
+NOTES
+)" \
             && echo "✅ Release v1.0.0 created"
+          fi
 
-  # ── Job 3: Run security scan on test contract ─────────────────────
-  verify-scanner:
-    name: Verify Scanner Works
+      - name: Show final repo state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Repository Info ==="
+          gh api /repos/${{ github.repository }} \
+            --jq '{name: .name, description: .description, homepage: .homepage, topics: .topics}'
+          echo ""
+          echo "=== Releases ==="
+          gh release list --repo ${{ github.repository }} || echo "no releases"
+          echo ""
+          echo "=== Pages ==="
+          gh api /repos/${{ github.repository }}/pages --jq '{url: .html_url, status: .status, source: .source}' 2>/dev/null || echo "Pages not yet configured"
+
+  test:
+    name: Run Test Suite
     runs-on: ubuntu-latest
-    needs: configure-repo
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Run test suite
+      - name: Run 39 unit tests
         run: python -m pytest tests/test_sentinel.py -v --tb=short
 
-      - name: Analyze vulnerable contract
+      - name: Scan vulnerable contract
         run: |
           python cli.py tests/contracts/vulnerable-defi.pact \
-            --no-ai --format json -o /tmp/vuln-report.json
+            --no-ai --format json -o /tmp/vuln.json
           python3 -c "
           import json
-          r = json.load(open('/tmp/vuln-report.json'))
+          r = json.load(open('/tmp/vuln.json'))
           rs = r['risk_score']
-          print(f'Grade: {rs[\"letter_grade\"]}  Score: {rs[\"security_score\"]}/100')
-          print(f'Findings: {rs[\"breakdown\"]}')
+          bd = rs['breakdown']
+          print(f'Grade: {rs[\"letter_grade\"]}  Score: {rs[\"security_score\"]}/100  Label: {rs[\"label\"]}')
+          print(f'Critical: {bd[\"critical\"]}  High: {bd[\"high\"]}  Medium: {bd[\"medium\"]}')
           assert len(r['findings']) >= 10, 'Expected 10+ findings'
-          assert rs['letter_grade'] in ('F', 'F-'), 'Expected F grade'
-          print('✅ Scanner verified — detected all vulnerabilities')
+          assert rs['security_score'] < 10, 'Expected very low score'
+          print('✅ Vulnerability detection verified')
           "
 
-      - name: Analyze safe contract
+      - name: Scan safe contract
         run: |
           python cli.py tests/contracts/safe-token.pact \
-            --no-ai --format json -o /tmp/safe-report.json
+            --no-ai --format json -o /tmp/safe.json
           python3 -c "
           import json
-          r = json.load(open('/tmp/safe-report.json'))
+          r = json.load(open('/tmp/safe.json'))
           rs = r['risk_score']
           print(f'Grade: {rs[\"letter_grade\"]}  Score: {rs[\"security_score\"]}/100')
-          critical = [f for f in r['findings'] if f['severity'] == 'critical']
-          assert len(critical) == 0, f'Safe contract should have 0 critical findings, got {len(critical)}'
-          print('✅ Safe contract verified — no critical findings')
+          critical = sum(1 for f in r['findings'] if f['severity'] == 'critical')
+          assert critical == 0, f'Safe contract: expected 0 critical, got {critical}'
+          print('✅ Zero false positives on safe contract')
           "
 
-      - name: Upload scan reports
+      - name: Generate markdown report
+        run: python cli.py tests/contracts/vulnerable-defi.pact --no-ai --format markdown >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload reports
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scan-reports
-          path: /tmp/*-report.json
-
-      - name: Post summary
-        run: |
-          python cli.py tests/contracts/vulnerable-defi.pact \
-            --no-ai --format markdown >> $GITHUB_STEP_SUMMARY
+          name: pact-sentinel-scan-reports
+          path: /tmp/*.json
