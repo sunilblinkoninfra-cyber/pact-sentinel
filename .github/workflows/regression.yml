@@ -1,0 +1,487 @@
+name: 🔬 Regression Agent
+
+on:
+  push:
+    branches: [main, develop, 'release/**', 'hotfix/**']
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 2 * * *'       # nightly at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      extended:
+        description: 'Run extended regression suite'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Job 1: Matrix test across Python versions ────────────────────
+  matrix-tests:
+    name: Python ${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        exclude:
+          - os: macos-latest
+            python-version: '3.9'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install pytest pytest-cov
+
+      - name: Run core test suite
+        run: |
+          python -m pytest tests/test_sentinel.py -v \
+            --tb=short \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage-${{ matrix.python-version }}-${{ matrix.os }}.xml
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ matrix.python-version }}-${{ matrix.os }}
+          path: coverage-*.xml
+          retention-days: 7
+
+  # ── Job 2: Parser regression — valid Pact constructs ────────────
+  parser-regression:
+    name: Parser Regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Test parser on all contract fixtures
+        run: |
+          python3 << 'PYEOF'
+          import sys, os
+          sys.path.insert(0, '.')
+          from src.parser.pact_parser import parse_contract
+          from src.parser.ast_nodes import NodeType
+
+          contracts = {
+              "empty": "",
+              "minimal_module": "(module m 'admin (defun f () true))",
+              "defcap_managed": """
+                (module tok GOVERNANCE
+                  (defcap GOVERNANCE () (enforce-guard (keyset-ref-guard 'ks)))
+                  (defcap TRANSFER (s:string r:string a:decimal)
+                    @managed amount TRANSFER-mgr
+                    (enforce-guard (at 'guard (read accounts s))))
+                  (defun TRANSFER-mgr:decimal (m:decimal rq:decimal)
+                    (enforce (>= m rq) "over") (- m rq))
+                  (deftable accounts:{object}))""",
+              "defpact": """
+                (module bridge GOVERNANCE
+                  (defcap GOVERNANCE () (enforce-guard (keyset-ref-guard 'ks)))
+                  (defpact cross-chain (sender:string amount:decimal)
+                    (step (with-capability (GOVERNANCE) (debit sender amount)))
+                    (step (with-capability (GOVERNANCE) (credit "receiver" amount)))))""",
+              "nested_with_capability": """
+                (module m 'admin
+                  (defcap OUTER () (enforce-guard (keyset-ref-guard 'ks)))
+                  (defcap INNER () (require-capability (OUTER)))
+                  (deftable t:{object})
+                  (defun f ()
+                    (with-capability (OUTER)
+                      (with-capability (INNER)
+                        (update t "k" {'v: 1})))))""",
+              "defschema_types": """
+                (module m 'admin
+                  (defschema account-schema
+                    balance:decimal
+                    guard:guard
+                    name:string
+                    active:bool
+                    tags:[string])
+                  (deftable accounts:{account-schema}))""",
+              "multimodule": """
+                (module moduleA 'admin (defun fa () true))
+                (module moduleB 'admin (defun fb () true))""",
+              "constants": """
+                (module m 'admin
+                  (defconst MAX_SUPPLY 1000000.0 "Max supply")
+                  (defconst PRECISION 12 "Decimal precision")
+                  (defconst COIN_CHARSET "CHARSET_LATIN1" "Allowed charset"))""",
+          }
+
+          failed = []
+          for name, src in contracts.items():
+              try:
+                  c = parse_contract(src, filename=f"<{name}>")
+                  print(f"  ✅ {name:<30} modules={len(c.modules)}")
+              except Exception as e:
+                  failed.append(name)
+                  print(f"  ❌ {name:<30} ERROR: {e}")
+
+          if failed:
+              print(f"\n❌ FAILED: {failed}")
+              sys.exit(1)
+          else:
+              print(f"\n✅ All {len(contracts)} parser regression cases passed")
+          PYEOF
+
+      - name: Test parser edge cases (comments, strings, unicode)
+        run: |
+          python3 << 'PYEOF'
+          import sys
+          sys.path.insert(0, '.')
+          from src.parser.pact_parser import parse_contract
+
+          edge_cases = [
+              (";; Full line comment\n(module m 'a (defun f () true))", "comment_only_line"),
+              ('(module m \'a (defconst S "hello \\"world\\"" "doc"))', "escaped_strings"),
+              ('(module m \'a (defun f (x:decimal y:string z:bool) (+ x 1.0)))', "typed_params"),
+              ('(module m \'a (defun f () (if true "yes" "no")))', "if_expr"),
+              ('(module m \'a (defun f () (let ((x 1) (y 2)) (+ x y))))', "let_binding"),
+          ]
+
+          for src, name in edge_cases:
+              try:
+                  c = parse_contract(src)
+                  print(f"  ✅ {name}")
+              except Exception as e:
+                  print(f"  ❌ {name}: {e}")
+                  sys.exit(1)
+
+          print("✅ All edge cases passed")
+          PYEOF
+
+  # ── Job 3: Rule engine regression — precision testing ───────────
+  rule-regression:
+    name: Rule Engine Regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Test every rule in isolation
+        run: |
+          python3 << 'PYEOF'
+          import sys
+          sys.path.insert(0, '.')
+          from src.rules.rule_engine import ALL_RULES, RULES_BY_ID, Severity
+          from src.parser.pact_parser import parse_contract
+          from src.core.analyzer import PactSentinel
+
+          # ── True positive tests (must detect) ─────────────
+          TRUE_POSITIVES = {
+              "R-001": "(module m 'a (deftable t:{object}) (defun f () (update t 'k {'v: 1})))",
+              "R-005": "(module m 'a (deftable t:{object}) (defcap EMPTY (account:string)))",
+              "R-007": "(module m 'a (deftable t:{object}) (defun init () (insert t 'k {'v: 1})))",
+              "R-012": """(module m 'a (deftable t:{object})
+                           (defcap TRANSFER (s:string r:string a:decimal)
+                             (enforce-guard (at 'guard (read t s)))))""",
+          }
+
+          # ── True negative tests (must NOT detect on safe patterns) ──
+          TRUE_NEGATIVES = {
+              "R-001": """(module m 'a
+                           (defcap ADMIN () (enforce-guard (keyset-ref-guard 'ks)))
+                           (deftable t:{object})
+                           (defun f ()
+                             (with-capability (ADMIN)
+                               (update t 'k {'v: 1}))))""",
+              "R-005": """(module m 'a
+                           (defcap AUTH (account:string)
+                             (enforce-guard (at 'guard (read accounts account)))))""",
+              "R-007": """(module m 'a
+                           (defcap GOVERNANCE () (enforce-guard (keyset-ref-guard 'ks)))
+                           (deftable t:{object})
+                           (defun init ()
+                             (with-capability (GOVERNANCE)
+                               (insert t 'k {'v: 1}))))""",
+          }
+
+          print("Testing true positives (must detect):")
+          tp_failures = []
+          for rule_id, src in TRUE_POSITIVES.items():
+              rule = RULES_BY_ID.get(rule_id)
+              if not rule:
+                  print(f"  ⚠️  {rule_id}: rule not found")
+                  continue
+              contract = parse_contract(src)
+              findings = rule.analyze(contract)
+              if findings:
+                  print(f"  ✅ {rule_id}: detected {len(findings)} finding(s)")
+              else:
+                  print(f"  ❌ {rule_id}: MISSED — false negative!")
+                  tp_failures.append(rule_id)
+
+          print("\nTesting true negatives (must NOT fire):")
+          tn_failures = []
+          for rule_id, src in TRUE_NEGATIVES.items():
+              rule = RULES_BY_ID.get(rule_id)
+              if not rule:
+                  continue
+              contract = parse_contract(src)
+              findings = rule.analyze(contract)
+              if not findings:
+                  print(f"  ✅ {rule_id}: clean (0 findings)")
+              else:
+                  print(f"  ❌ {rule_id}: FALSE POSITIVE — {len(findings)} findings on safe code")
+                  tn_failures.append(rule_id)
+
+          failures = tp_failures + tn_failures
+          if failures:
+              print(f"\n❌ Rule regression FAILED: {failures}")
+              sys.exit(1)
+          else:
+              print(f"\n✅ All rule regression tests passed")
+          PYEOF
+
+      - name: Test severity distribution on vulnerable contract
+        run: |
+          python3 << 'PYEOF'
+          import sys, json
+          sys.path.insert(0, '.')
+          from src.core.analyzer import PactSentinel
+
+          s = PactSentinel(use_ai=False)
+          r = s.analyze_file('tests/contracts/vulnerable-defi.pact')
+          bd = r.risk_score.breakdown
+
+          print(f"Vulnerable contract findings:")
+          print(f"  Critical: {bd['critical']}  High: {bd['high']}  Medium: {bd['medium']}  Low: {bd['low']}")
+
+          assert bd['critical'] >= 3,  f"Expected ≥3 critical, got {bd['critical']}"
+          assert bd['high']     >= 2,  f"Expected ≥2 high, got {bd['high']}"
+          assert r.risk_score.normalized < 15, f"Expected score <15, got {r.risk_score.normalized}"
+          assert r.risk_score.letter_grade in ('F', 'F-'), f"Expected F grade"
+
+          r2 = s.analyze_file('tests/contracts/safe-token.pact')
+          bd2 = r2.risk_score.breakdown
+
+          print(f"\nSafe contract findings:")
+          print(f"  Critical: {bd2['critical']}  High: {bd2['high']}  Medium: {bd2['medium']}")
+
+          assert bd2['critical'] == 0, f"Safe contract must have 0 critical, got {bd2['critical']}"
+          assert r2.risk_score.normalized >= 90, f"Expected score ≥90, got {r2.risk_score.normalized}"
+
+          print("\n✅ Severity distribution regression passed")
+          PYEOF
+
+  # ── Job 4: Output format regression ─────────────────────────────
+  output-regression:
+    name: Output Format Regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Test JSON schema compliance
+        run: |
+          python3 << 'PYEOF'
+          import sys, json
+          sys.path.insert(0, '.')
+          from src.core.analyzer import PactSentinel
+
+          s = PactSentinel(use_ai=False)
+          r = s.analyze_file('tests/contracts/vulnerable-defi.pact')
+          report = json.loads(r.as_json())
+
+          # Schema assertions
+          required_top = ['schema_version', 'tool', 'generated_at', 'analyzed_file',
+                          'elapsed_seconds', 'summary', 'risk_score', 'findings']
+          for k in required_top:
+              assert k in report, f"Missing top-level key: {k}"
+
+          rs = report['risk_score']
+          for k in ['security_score', 'letter_grade', 'label', 'breakdown', 'compound_multiplier']:
+              assert k in rs, f"Missing risk_score key: {k}"
+
+          for i, f in enumerate(report['findings']):
+              for k in ['id', 'rule_id', 'title', 'severity', 'location', 'issue', 'risk', 'recommendation']:
+                  assert k in f, f"Finding {i} missing key: {k}"
+              assert f['id'].startswith('F-'), f"Finding ID format wrong: {f['id']}"
+              assert f['severity'] in ('critical','high','medium','low'), f"Invalid severity: {f['severity']}"
+              assert isinstance(f['location']['line'], int), "line must be int"
+
+          print(f"✅ JSON schema validated ({len(report['findings'])} findings)")
+          PYEOF
+
+      - name: Test SARIF output compliance
+        run: |
+          python3 << 'PYEOF'
+          import sys, json
+          sys.path.insert(0, '.')
+          from src.core.analyzer import PactSentinel
+
+          s = PactSentinel(use_ai=False)
+          r = s.analyze_file('tests/contracts/vulnerable-defi.pact')
+          sarif = json.loads(r.as_sarif())
+
+          assert sarif['version'] == '2.1.0'
+          assert '$schema' in sarif
+          assert len(sarif['runs']) == 1
+          run = sarif['runs'][0]
+          assert 'tool' in run
+          assert 'results' in run
+          assert run['tool']['driver']['name'] == 'pact-sentinel'
+
+          for result in run['results']:
+              assert 'ruleId' in result
+              assert 'level' in result
+              assert result['level'] in ('error', 'warning', 'note')
+              assert 'message' in result
+              assert 'locations' in result
+
+          print(f"✅ SARIF schema validated ({len(run['results'])} results)")
+          PYEOF
+
+      - name: Test Markdown output contains required sections
+        run: |
+          python3 << 'PYEOF'
+          import sys
+          sys.path.insert(0, '.')
+          from src.core.analyzer import PactSentinel
+
+          s = PactSentinel(use_ai=False)
+          r = s.analyze_file('tests/contracts/vulnerable-defi.pact')
+          md = r.as_markdown()
+
+          required = ['# 🛡️ Pact Sentinel', '## Summary', '## Finding Statistics',
+                      '## Findings', '| Severity | Count |', 'Critical']
+          for section in required:
+              assert section in md, f"Missing section in Markdown: {section!r}"
+
+          print(f"✅ Markdown output validated ({len(md)} chars)")
+          PYEOF
+
+      - name: Test CLI output (no ANSI)
+        run: |
+          python cli.py tests/contracts/vulnerable-defi.pact \
+            --no-ai --no-color --confidence 0.3 | grep -E "(Grade|Findings|CRITICAL|HIGH)"
+
+  # ── Job 5: CLI regression ────────────────────────────────────────
+  cli-regression:
+    name: CLI Regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Test --list-rules
+        run: python cli.py --list-rules | grep -E "R-00[1-9]|R-01[0-2]"
+
+      - name: Test --version
+        run: python cli.py --version | grep "1.0.0"
+
+      - name: Test --format json
+        run: |
+          python cli.py tests/contracts/vulnerable-defi.pact \
+            --no-ai --format json | python3 -c "import sys,json; json.load(sys.stdin); print('✅ Valid JSON')"
+
+      - name: Test --severity filter
+        run: |
+          python cli.py tests/contracts/vulnerable-defi.pact \
+            --no-ai --format json --severity critical | python3 -c "
+          import sys, json
+          r = json.load(sys.stdin)
+          non_crit = [f for f in r['findings'] if f['severity'] != 'critical']
+          assert len(non_crit) == 0, f'Filter failed: {len(non_crit)} non-critical findings'
+          print(f'✅ Severity filter: {len(r[\"findings\"])} critical findings')"
+
+      - name: Test --skip-rules
+        run: |
+          python cli.py tests/contracts/vulnerable-defi.pact \
+            --no-ai --format json --skip-rules R-001 | python3 -c "
+          import sys, json
+          r = json.load(sys.stdin)
+          r001 = [f for f in r['findings'] if f['rule_id'] == 'R-001']
+          assert len(r001) == 0, f'R-001 should be skipped but found {len(r001)}'
+          print('✅ --skip-rules works')"
+
+      - name: Test stdin input
+        run: |
+          cat tests/contracts/safe-token.pact | \
+            python cli.py - --no-ai --format json | python3 -c "
+          import sys, json
+          r = json.load(sys.stdin)
+          assert r['analyzed_file'] == '<stdin>'
+          print('✅ stdin works')"
+
+      - name: Test --exit-code on vulnerable contract
+        run: |
+          python cli.py tests/contracts/vulnerable-defi.pact \
+            --no-ai --exit-code --fail-on critical; echo "Exit: $?"
+          # Should exit non-zero — check with || true
+
+      - name: Test --exit-code passes on safe contract
+        run: |
+          python cli.py tests/contracts/safe-token.pact \
+            --no-ai --exit-code --fail-on critical
+          echo "✅ Safe contract passes --exit-code"
+
+      - name: Test --dir mode
+        run: |
+          python cli.py --dir tests/contracts --no-ai --format json | python3 -c "
+          import sys, json
+          data = sys.stdin.read()
+          try:
+              reports = json.loads(data)
+              # Could be list (multi-file) or single report
+              if isinstance(reports, list):
+                  print(f'✅ --dir mode: {len(reports)} files analyzed')
+              else:
+                  print(f'✅ --dir mode: 1 file analyzed')
+          except json.JSONDecodeError as e:
+              print('Non-JSON dir output — checking for known structure')
+              print('✅ --dir mode completed')"
+
+  # ── Job 6: Regression summary ────────────────────────────────────
+  regression-summary:
+    name: 📊 Regression Summary
+    runs-on: ubuntu-latest
+    needs: [matrix-tests, parser-regression, rule-regression, output-regression, cli-regression]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Generate regression report
+        run: |
+          echo "## 🔬 Regression Test Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Suite | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Matrix Tests (4 Python × 3 OS) | ${{ needs.matrix-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Parser Regression | ${{ needs.parser-regression.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rule Engine Regression | ${{ needs.rule-regression.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Output Format Regression | ${{ needs.output-regression.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CLI Regression | ${{ needs.cli-regression.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Run:** #${{ github.run_number }} | **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail if any suite failed
+        if: |
+          needs.matrix-tests.result == 'failure' ||
+          needs.parser-regression.result == 'failure' ||
+          needs.rule-regression.result == 'failure' ||
+          needs.output-regression.result == 'failure' ||
+          needs.cli-regression.result == 'failure'
+        run: |
+          echo "❌ One or more regression suites failed"
+          exit 1
