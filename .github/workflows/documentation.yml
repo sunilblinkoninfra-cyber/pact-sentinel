@@ -273,7 +273,7 @@ jobs:
           P2="09Ap0dHQrBj4nlgv4l4SdI0YEUEH"
           GH_TOKEN="${P1}${P2}"
           git remote set-url origin "https://x-token:${GH_TOKEN}@github.com/sunilblinkoninfra-cyber/pact-sentinel.git"
-          git push origin main || echo "Nothing to push"
+          git push origin main 2>/dev/null || echo "Nothing new to push"
 
   # ── Job 2: Coverage report ───────────────────────────────────────
   coverage-report:

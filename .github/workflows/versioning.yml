@@ -25,6 +25,7 @@ jobs:
   analyze-commits:
     name: Analyze Commits for Version
     runs-on: ubuntu-latest
+    continue-on-error: false
     outputs:
       bump_type: ${{ steps.analyze.outputs.bump_type }}
       current_version: ${{ steps.analyze.outputs.current_version }}

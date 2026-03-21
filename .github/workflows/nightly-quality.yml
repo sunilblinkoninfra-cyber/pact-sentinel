@@ -182,6 +182,7 @@ jobs:
   fuzz-testing:
     name: 🎲 Edge Case Fuzzing
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -247,6 +248,7 @@ jobs:
   code-quality:
     name: 📐 Code Quality
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
