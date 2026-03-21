@@ -253,7 +253,7 @@ jobs:
         with: { python-version: '3.11' }
 
       - name: Install quality tools
-        run: pip install radon flake8
+        run: pip install radon flake8 --break-system-packages || pip install radon flake8
 
       - name: Measure code complexity
         run: |

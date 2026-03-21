@@ -86,8 +86,8 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      - name: Install Bandit
-        run: pip install bandit[toml]
+      - name: Install security tools
+        run: pip install bandit[toml] pip-audit
 
       - name: Run Bandit SAST
         run: |
@@ -141,6 +141,7 @@ jobs:
       - name: Check for known vulnerabilities in optional deps
         run: |
           pip install pip-audit flask pytest --quiet 2>/dev/null || true
+          pip install flask pytest --quiet 2>/dev/null || true
           pip-audit --format json -o /tmp/audit.json 2>/dev/null || true
 
           python3 << 'PYEOF'
