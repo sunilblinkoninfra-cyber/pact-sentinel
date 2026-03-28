@@ -7,7 +7,7 @@ on:
     inputs:
       version:
         description: 'Version to validate (e.g. 1.0.0)'
-        required: true
+        required: false
         default: '1.0.0'
       deploy_pages:
         description: 'Deploy docs to GitHub Pages'
