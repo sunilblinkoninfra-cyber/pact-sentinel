@@ -110,7 +110,6 @@ def main():
     if not args.no_ai and not getattr(args, 'summary', False):
         info = sentinel.ai.get_provider_info()
         if info['available'] == 'True':
-            import sys
             print(f"  AI: {info['provider'].upper()} ({info['model']}) {info['key_prefix']}", file=sys.stderr)
 
     if args.dir:

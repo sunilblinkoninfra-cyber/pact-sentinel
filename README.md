@@ -266,3 +266,31 @@ pact-sentinel/
 ---
 
 <div align="center">Built for the Kadena Pact security competition. Star ⭐ if this helps you write safer contracts.</div>
+
+## Usage
+
+```bash
+# Analyze a contract (no AI)
+python cli.py mytoken.pact --no-ai
+
+# With OpenAI GPT-4o
+python cli.py mytoken.pact --openai-key sk-proj-...
+
+# With Anthropic Claude  
+python cli.py mytoken.pact --anthropic-key sk-ant-...
+
+# Scan a directory
+python cli.py --dir contracts/ --no-ai
+
+# CI one-liner
+python cli.py contract.pact --no-ai --summary
+
+# Export formats
+python cli.py contract.pact --no-ai --format json -o report.json
+python cli.py contract.pact --no-ai --format sarif -o results.sarif
+python cli.py contract.pact --no-ai --format markdown -o report.md
+
+# Filter findings
+python cli.py contract.pact --no-ai --severity critical
+python cli.py contract.pact --no-ai --skip-rules R-003,R-009
+```
