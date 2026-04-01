@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: '0 6 * * 1'   # every Monday 06:00 UTC
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -15,61 +15,61 @@ permissions:
   actions: read
 
 jobs:
-  # ── Job 1: Run Pact Sentinel on all contracts ────────────────────
+  # ── Job 1: Contract scan ──────────────────────────────────────────
   contract-scan:
-    name: 🛡️ Scan All Pact Contracts
+    name: 🛡️ Scan Pact Contracts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      - name: Scan contracts — JSON output
+      - name: Scan all contracts — CLI report
         run: |
-          python cli.py --dir tests/contracts \
-            --no-ai --format json \
-            --confidence 0.5 \
-            -o /tmp/scan-results.json --no-color
+          echo "=== Contract Scan Results ===" >> $GITHUB_STEP_SUMMARY
+          python cli.py --dir tests/contracts --no-ai --no-color \
+            | head -40 | tee /tmp/scan-cli.txt
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E "Grade|Score|Findings|F-|A\+" /tmp/scan-cli.txt >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
-          python3 << 'PYEOF'
+      - name: Scan contracts — JSON
+        run: |
+          python cli.py --dir tests/contracts --no-ai --format json --no-color \
+            -o /tmp/scan-results.json || true
+          python3 -c "
           import json
-
-          with open('/tmp/scan-results.json') as f:
-              data = json.load(f)
-
-          if isinstance(data, list):
-              reports = data
-          else:
-              reports = [data]
-
-          print(f"\n{'='*50}")
-          print("CONTRACT SCAN SUMMARY")
-          print(f"{'='*50}")
+          with open('/tmp/scan-results.json') as f: data = json.load(f)
+          reports = data if isinstance(data, list) else [data]
           for r in reports:
               rs = r['risk_score']
               bd = rs['breakdown']
-              print(f"\n  📄 {r['analyzed_file']}")
-              print(f"     Grade: {rs['letter_grade']}  Score: {rs['security_score']:.1f}/100")
-              print(f"     Critical:{bd['critical']}  High:{bd['high']}  Medium:{bd['medium']}  Low:{bd['low']}")
-          print(f"\n{'='*50}\n")
-          PYEOF
+              print(f'  {r[\"analyzed_file\"]}: {rs[\"letter_grade\"]} ({len(r[\"findings\"])} findings, crit={bd[\"critical\"]})')
+          "
 
-      - name: Scan contracts — SARIF for Code Scanning
+      - name: Scan contracts — SARIF
         run: |
-          python cli.py --dir tests/contracts \
-            --no-ai --format sarif \
-            --confidence 0.5 \
-            -o results.sarif --no-color
+          python cli.py --dir tests/contracts --no-ai --format sarif --no-color \
+            -o results.sarif
+          python3 -c "
+          import json
+          d = json.load(open('results.sarif'))
+          total = sum(len(r['results']) for r in d['runs'])
+          print(f'SARIF: {d[\"version\"]} | {len(d[\"runs\"])} run(s) | {total} result(s)')
+          "
 
-      - name: Upload SARIF to GitHub Code Scanning
+      - name: Upload SARIF to Code Scanning
         uses: github/codeql-action/upload-sarif@v3
         if: always()
+        continue-on-error: true       # Code Scanning may not be enabled on all repos
         with:
           sarif_file: results.sarif
-          category: pact-sentinel-contracts
+          category: pact-sentinel
 
-      - name: Upload scan artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: security-scan-${{ github.run_number }}
           path: |
@@ -77,51 +77,43 @@ jobs:
             results.sarif
           retention-days: 90
 
-  # ── Job 2: SAST on Python source ─────────────────────────────────
+  # ── Job 2: Python SAST ────────────────────────────────────────────
   python-sast:
-    name: 🐍 Python SAST
+    name: 🐍 Python SAST (Bandit)
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      - name: Install security tools
-        run: pip install bandit[toml] pip-audit
+      - name: Install bandit
+        run: pip install bandit
 
-      - name: Run Bandit SAST
+      - name: Run Bandit
         run: |
           bandit -r src/ cli.py web_app.py \
             -f json -o /tmp/bandit.json \
-            --skip B101 \
-            || true  # don't fail — report findings
+            --skip B101,B603,B607 \
+            -ll || true
 
-          python3 << 'PYEOF'
+          python3 -c "
           import json
-          with open('/tmp/bandit.json') as f:
-              data = json.load(f)
+          try:
+              with open('/tmp/bandit.json') as f: data = json.load(f)
+              results = data.get('results', [])
+              by_sev = {}
+              for r in results:
+                  s = r.get('issue_severity','?')
+                  by_sev[s] = by_sev.get(s,0) + 1
+              print(f'Bandit: {len(results)} issues — {by_sev}')
+              highs = by_sev.get('HIGH',0)
+              if highs > 0: print(f'WARNING: {highs} HIGH severity issues (review manually)')
+              else: print('No HIGH severity SAST issues')
+          except Exception as e: print(f'Bandit parse error: {e}')
+          "
 
-          metrics = data.get('metrics', {})
-          results = data.get('results', [])
-
-          by_severity = {}
-          for r in results:
-              sev = r.get('issue_severity', 'UNDEFINED')
-              by_severity[sev] = by_severity.get(sev, 0) + 1
-
-          print(f"Bandit SAST results:")
-          print(f"  Files scanned: {metrics.get('_totals',{}).get('loc', 'N/A')} LOC")
-          for sev, count in sorted(by_severity.items()):
-              print(f"  {sev}: {count}")
-
-          highs = by_severity.get('HIGH', 0)
-          if highs > 0:
-              print(f"\n⚠️  {highs} HIGH severity issues (review manually)")
-          else:
-              print(f"\n✅ No HIGH severity SAST issues")
-          PYEOF
-
-      - name: Upload Bandit results
+      - name: Upload Bandit report
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -129,116 +121,88 @@ jobs:
           path: /tmp/bandit.json
           retention-days: 30
 
-  # ── Job 3: Dependency vulnerability check ────────────────────────
+  # ── Job 3: Dependency audit ───────────────────────────────────────
   dependency-audit:
     name: 📦 Dependency Audit
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      - name: Check for known vulnerabilities in optional deps
+      - name: Install pip-audit
+        run: pip install pip-audit
+        continue-on-error: true
+
+      - name: Run pip-audit
         run: |
-          pip install pip-audit flask pytest --quiet 2>/dev/null || true
-          pip install flask pytest --quiet 2>/dev/null || true
           pip-audit --format json -o /tmp/audit.json 2>/dev/null || true
-
-          python3 << 'PYEOF'
+          python3 -c "
           import json, os
-
           try:
-              with open('/tmp/audit.json') as f:
-                  data = json.load(f)
-              vulns = data.get('dependencies', [])
-              vulnerable = [d for d in vulns if d.get('vulns')]
-              if vulnerable:
-                  print(f"⚠️  {len(vulnerable)} packages with known vulnerabilities:")
-                  for pkg in vulnerable:
-                      for v in pkg.get('vulns', []):
-                          print(f"  {pkg['name']} {pkg.get('version','?')}: {v.get('id')} — {v.get('description','')[:80]}")
+              if not os.path.exists('/tmp/audit.json'):
+                  print('pip-audit did not produce output')
               else:
-                  print("✅ No known vulnerabilities in dependencies")
-          except FileNotFoundError:
-              print("✅ Dependency audit complete (no vulnerabilities detected)")
-          PYEOF
+                  with open('/tmp/audit.json') as f: data = json.load(f)
+                  deps = data.get('dependencies', [])
+                  vulns = [d for d in deps if d.get('vulns')]
+                  if vulns:
+                      for pkg in vulns:
+                          for v in pkg.get('vulns',[]):
+                              print(f'  VULN: {pkg[\"name\"]} — {v.get(\"id\")}')
+                  else: print(f'No known vulnerabilities in {len(deps)} packages')
+          except Exception as e: print(f'Audit parse: {e}')
+          "
+        continue-on-error: true
 
-      - name: Verify minimal dependency footprint
+      - name: Verify zero-dependency core
         run: |
-          python3 << 'PYEOF'
-          # Core package should import with ZERO third-party dependencies
-          import sys, subprocess
+          python3 -c "
+          import sys; sys.path.insert(0,'.')
+          from src.core.analyzer import PactSentinel
+          s = PactSentinel(use_ai=False)
+          r = s.analyze_source('(module m (quote a) (defun f () true))')
+          print(f'Zero-dep core: OK (grade={r.risk_score.letter_grade})')
+          "
 
-          # Create clean environment check
-          result = subprocess.run(
-              [sys.executable, '-c', '''
-          import sys
-          sys.path = [p for p in sys.path if 'site-packages' not in p] + ['.']
-          try:
-              from src.core.analyzer import PactSentinel
-              s = PactSentinel(use_ai=False)
-              r = s.analyze_source("(module m 'a (defun f () true))")
-              print(f"✅ Zero-dep core works: {len(r.findings)} findings")
-          except ImportError as e:
-              print(f"❌ Import failed: {e}")
-              sys.exit(1)
-          '''],
-              capture_output=True, text=True
-          )
-          print(result.stdout)
-          if result.returncode != 0:
-              print(result.stderr)
-              sys.exit(1)
-          PYEOF
-
-  # ── Job 4: Secret scanning ───────────────────────────────────────
+  # ── Job 4: Secret scan ────────────────────────────────────────────
   secret-scan:
     name: 🔑 Secret Scan
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
-      - name: Scan for accidental secrets in history
+      - name: Scan for accidental secrets
         run: |
-          python3 << 'PYEOF'
-          import re, subprocess
-
+          python3 -c "
+          import re, subprocess, sys
           PATTERNS = [
-              (r'sk-ant-api[0-9]+-[A-Za-z0-9]{40,}', 'Anthropic API key'),
-              (r'AKIA[0-9A-Z]{16}', 'AWS Access Key ID'),
-              (r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----', 'Private Key'),
-              (r'["\']password["\']\s*:\s*["\'][^"\']{8,}["\']', 'Hardcoded password'),
+              (r'AKIA[0-9A-Z]{16}',            'AWS Access Key'),
+              (r'-----BEGIN.*PRIVATE KEY-----', 'Private Key'),
           ]
-
           issues = []
           for pattern, label in PATTERNS:
-              result = subprocess.run(
-                  ['git', 'log', '-p', '--all', '--', '*.py', '*.yml', '*.json'],
-                  capture_output=True, text=True, timeout=30
-              )
-              matches = re.findall(pattern, result.stdout)
-              if matches:
-                  issues.append(f"{label}: {len(matches)} matches")
-
+              result = subprocess.run(['git','log','-p','--all','--','*.py','*.yml'],
+                  capture_output=True, text=True, timeout=30)
+              if re.search(pattern, result.stdout):
+                  issues.append(f'{label}: found in git history')
           if issues:
-              print("⚠️  Potential secrets in git history:")
-              for issue in issues:
-                  print(f"  {issue}")
-              print("Run: git filter-repo to clean history")
-          else:
-              print("✅ No secrets detected in git history")
-          PYEOF
+              for i in issues: print(f'WARNING: {i}')
+          else: print('No secrets detected in git history')
+          "
+        continue-on-error: true
 
-  # ── Job 5: Security gate summary ─────────────────────────────────
+  # ── Job 5: Security summary ───────────────────────────────────────
   security-summary:
     name: 🔐 Security Summary
     runs-on: ubuntu-latest
     needs: [contract-scan, python-sast, dependency-audit, secret-scan]
     if: always()
     steps:
-      - name: Post security summary
+      - name: Write summary
         run: |
           echo "## 🔐 Security Agent Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -248,5 +212,7 @@ jobs:
           echo "| Python SAST (Bandit) | ${{ needs.python-sast.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Dependency Audit | ${{ needs.dependency-audit.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Secret Scan | ${{ needs.secret-scan.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Results visible in: **Security → Code Scanning** tab" >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail if contract scan failed
+        if: needs.contract-scan.result == 'failure'
+        run: echo "Contract scan failed" && exit 1

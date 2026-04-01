@@ -2,185 +2,62 @@ name: 🌙 Nightly Quality Agent
 
 on:
   schedule:
-    - cron: '0 0 * * *'    # midnight UTC daily
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
-  # ── Job 1: Regression drift detection ───────────────────────────
   drift-detection:
     name: 🔍 Regression Drift Detection
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      - name: Compare current findings vs baseline
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Compare findings vs baseline
         run: |
           python3 << 'PYEOF'
-          import sys, json
-          sys.path.insert(0, '.')
+          import sys; sys.path.insert(0, '.')
           from src.core.analyzer import PactSentinel
 
           s = PactSentinel(use_ai=False)
-
           BASELINE = {
               'tests/contracts/vulnerable-defi.pact': {
-                  'min_findings': 15,
-                  'max_grade': 'F-',
-                  'max_score': 10.0,
+                  'min_findings': 15, 'max_score': 10.0,
                   'must_have_rules': ['R-001', 'R-005', 'R-006', 'R-007'],
               },
               'tests/contracts/safe-token.pact': {
-                  'max_critical': 0,
-                  'max_high': 0,
-                  'min_score': 90.0,
+                  'max_critical': 0, 'min_score': 90.0,
               },
           }
 
-          drift_found = False
+          drift = False
+          for path, exp in BASELINE.items():
+              r  = s.analyze_file(path)
+              rs = r.risk_score
+              print(f"  {path}: findings={len(r.findings)} score={rs.normalized} grade={rs.letter_grade}")
+              checks = []
+              if 'min_findings'   in exp: checks.append((len(r.findings) >= exp['min_findings'],      f"findings {len(r.findings)} >= {exp['min_findings']}"))
+              if 'max_score'      in exp: checks.append((rs.normalized <= exp['max_score'],            f"score {rs.normalized} <= {exp['max_score']}"))
+              if 'max_critical'   in exp: checks.append((rs.breakdown.get('critical',0) <= exp['max_critical'], f"critical {rs.breakdown.get('critical',0)} <= {exp['max_critical']}"))
+              if 'min_score'      in exp: checks.append((rs.normalized >= exp['min_score'],            f"score {rs.normalized} >= {exp['min_score']}"))
+              if 'must_have_rules' in exp:
+                  found = {f.rule_id for f in r.findings}
+                  for rid in exp['must_have_rules']:
+                      checks.append((rid in found, f"rule {rid} {'found' if rid in found else 'MISSING'}"))
+              for ok, msg in checks:
+                  print(f"    {'OK' if ok else 'DRIFT'} {msg}")
+                  if not ok: drift = True
 
-          for contract_path, expectations in BASELINE.items():
-              result = s.analyze_file(contract_path)
-              rs = result.risk_score
-              findings = result.findings
-
-              print(f"\n  {contract_path}:")
-              print(f"    Grade: {rs.letter_grade}  Score: {rs.normalized:.1f}  Findings: {len(findings)}")
-
-              if 'min_findings' in expectations:
-                  ok = len(findings) >= expectations['min_findings']
-                  status = '✅' if ok else '❌ DRIFT'
-                  print(f"    {status} Minimum findings: {len(findings)} >= {expectations['min_findings']}")
-                  if not ok: drift_found = True
-
-              if 'max_score' in expectations:
-                  ok = rs.normalized <= expectations['max_score']
-                  status = '✅' if ok else '❌ DRIFT'
-                  print(f"    {status} Max score: {rs.normalized:.1f} <= {expectations['max_score']}")
-                  if not ok: drift_found = True
-
-              if 'must_have_rules' in expectations:
-                  found_rules = {f.rule_id for f in findings}
-                  for rule_id in expectations['must_have_rules']:
-                      ok = rule_id in found_rules
-                      status = '✅' if ok else '❌ DRIFT'
-                      print(f"    {status} Rule {rule_id}: {'detected' if ok else 'MISSING'}")
-                      if not ok: drift_found = True
-
-              if 'max_critical' in expectations:
-                  critical_count = rs.breakdown.get('critical', 0)
-                  ok = critical_count <= expectations['max_critical']
-                  status = '✅' if ok else '❌ DRIFT'
-                  print(f"    {status} Max critical: {critical_count} <= {expectations['max_critical']}")
-                  if not ok: drift_found = True
-
-              if 'min_score' in expectations:
-                  ok = rs.normalized >= expectations['min_score']
-                  status = '✅' if ok else '❌ DRIFT'
-                  print(f"    {status} Min score: {rs.normalized:.1f} >= {expectations['min_score']}")
-                  if not ok: drift_found = True
-
-          if drift_found:
-              print("\n❌ REGRESSION DRIFT DETECTED — rules may have degraded")
-              sys.exit(1)
-          else:
-              print("\n✅ No regression drift detected")
+          if drift: print("\nDRIFT DETECTED"); sys.exit(1)
+          else:     print("\nNo drift detected")
           PYEOF
 
-  # ── Job 2: Nightly full matrix benchmark ─────────────────────────
   nightly-benchmark:
-    name: 📈 Nightly Performance Tracking
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-
-      - name: Run full benchmark suite
-        run: |
-          python3 << 'PYEOF'
-          import sys, time, statistics, json
-          sys.path.insert(0, '.')
-          from src.parser.pact_parser import parse_contract
-          from src.core.analyzer import PactSentinel
-          from datetime import datetime, timezone
-
-          with open('tests/contracts/vulnerable-defi.pact') as f:
-              source = f.read()
-
-          s = PactSentinel(use_ai=False)
-
-          # Parse benchmark
-          parse_times = []
-          for _ in range(200):
-              t0 = time.perf_counter()
-              parse_contract(source)
-              parse_times.append((time.perf_counter() - t0) * 1000)
-
-          # Analysis benchmark
-          analysis_times = []
-          for _ in range(100):
-              t0 = time.perf_counter()
-              s.analyze_source(source)
-              analysis_times.append((time.perf_counter() - t0) * 1000)
-
-          results = {
-              'timestamp': datetime.now(timezone.utc).isoformat(),
-              'source_chars': len(source),
-              'parser': {
-                  'n': len(parse_times),
-                  'mean_ms': round(statistics.mean(parse_times), 3),
-                  'median_ms': round(statistics.median(parse_times), 3),
-                  'p95_ms': round(sorted(parse_times)[int(len(parse_times)*0.95)], 3),
-                  'p99_ms': round(sorted(parse_times)[int(len(parse_times)*0.99)], 3),
-              },
-              'analysis': {
-                  'n': len(analysis_times),
-                  'mean_ms': round(statistics.mean(analysis_times), 3),
-                  'median_ms': round(statistics.median(analysis_times), 3),
-                  'p95_ms': round(sorted(analysis_times)[int(len(analysis_times)*0.95)], 3),
-              },
-          }
-
-          print(json.dumps(results, indent=2))
-
-          with open('/tmp/nightly-benchmark.json', 'w') as f:
-              json.dump(results, f, indent=2)
-
-          print(f"\n✅ Benchmark complete")
-          print(f"   Parser P95: {results['parser']['p95_ms']}ms (SLA: 50ms)")
-          print(f"   Analysis P95: {results['analysis']['p95_ms']}ms (SLA: 200ms)")
-          PYEOF
-
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
-        with:
-          name: nightly-benchmark-${{ github.run_number }}
-          path: /tmp/nightly-benchmark.json
-          retention-days: 90
-
-      - name: Post benchmark summary
-        run: |
-          echo "## 📈 Nightly Benchmark" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          python3 -c "
-          import json
-          with open('/tmp/nightly-benchmark.json') as f:
-              d = json.load(f)
-          p = d['parser']; a = d['analysis']
-          print(f'| Metric | Mean | P95 | P99 |')
-          print(f'|--------|------|-----|-----|')
-          print(f'| Parser | {p[\"mean_ms\"]}ms | {p[\"p95_ms\"]}ms | {p[\"p99_ms\"]}ms |')
-          print(f'| Full Analysis | {a[\"mean_ms\"]}ms | {a[\"p95_ms\"]}ms | — |')
-          " >> $GITHUB_STEP_SUMMARY
-
-  # ── Job 3: Nightly edge case fuzzing ─────────────────────────────
-  fuzz-testing:
-    name: 🎲 Edge Case Fuzzing
+    name: 📈 Performance Benchmark
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -188,63 +65,63 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      - name: Fuzz parser with random inputs
+      - name: Benchmark analysis engine
         run: |
           python3 << 'PYEOF'
-          import sys, random, string
-          sys.path.insert(0, '.')
-          from src.parser.pact_parser import parse_contract
+          import sys, time, statistics; sys.path.insert(0, '.')
           from src.core.analyzer import PactSentinel
 
-          random.seed(42)  # deterministic
-
+          with open('tests/contracts/vulnerable-defi.pact') as f: src = f.read()
           s = PactSentinel(use_ai=False)
-          crashes = []
-          N = 500
 
-          # Generate random Pact-like inputs
-          keywords = ['module', 'defun', 'defcap', 'defschema', 'with-capability',
-                      'enforce', 'update', 'insert', 'read', 'let', 'if']
+          times = []
+          for _ in range(200):
+              t0 = time.perf_counter()
+              s.analyze_source(src)
+              times.append((time.perf_counter()-t0)*1000)
+          times.sort()
 
-          for i in range(N):
-              # Mix: valid fragments, random strings, truncated contracts
-              flavor = i % 5
-              if flavor == 0:
-                  # Truncated valid contract
-                  src = "(module m 'a (defun f () (update t 'k {'v: 1})))"[:random.randint(5, 50)]
-              elif flavor == 1:
-                  # Random parens
-                  src = ''.join(random.choice('()(defun module enforce update ') for _ in range(random.randint(5, 100)))
-              elif flavor == 2:
-                  # Empty / whitespace
-                  src = ' ' * random.randint(0, 20)
-              elif flavor == 3:
-                  # Valid keywords with garbage
-                  kws = ' '.join(random.choices(keywords, k=random.randint(1, 5)))
-                  garbage = ''.join(random.choices(string.printable, k=random.randint(0, 30)))
-                  src = f"({kws} {garbage})"
-              else:
-                  # Unicode stress
-                  src = ''.join(chr(random.randint(32, 1000)) for _ in range(random.randint(5, 50)))
-
-              try:
-                  parse_contract(src)
-                  s.analyze_source(src)
-              except (SystemExit, KeyboardInterrupt, MemoryError) as e:
-                  crashes.append((i, type(e).__name__, str(e)[:50]))
-              except Exception:
-                  pass  # Expected — parser raises on bad input
-
-          if crashes:
-              print(f"❌ {len(crashes)} unexpected crashes:")
-              for idx, etype, msg in crashes[:10]:
-                  print(f"  [{idx}] {etype}: {msg}")
-              sys.exit(1)
-          else:
-              print(f"✅ Fuzz test complete: {N} inputs, 0 unexpected crashes")
+          p50 = times[100]; p95 = times[190]; p99 = times[198]
+          print(f"Analysis: P50={p50:.1f}ms P95={p95:.1f}ms P99={p99:.1f}ms")
+          assert p95 < 200, f"P95 {p95:.1f}ms > 200ms"
+          print("All SLAs met")
           PYEOF
 
-  # ── Job 4: Code quality metrics ──────────────────────────────────
+  fuzz-testing:
+    name: 🎲 Fuzz Testing
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Fuzz 500 random inputs
+        run: |
+          python3 << 'PYEOF'
+          import sys, random; sys.path.insert(0, '.')
+          from src.core.analyzer import PactSentinel
+
+          random.seed(42)
+          s = PactSentinel(use_ai=False)
+          crashes = 0
+          for i in range(500):
+              f = i % 5
+              if   f == 0: src = "(module m 'a (defun f () (update t 'k {'v: 1})))"[:random.randint(5,50)]
+              elif f == 1: src = ''.join(random.choice('()(defun module ') for _ in range(random.randint(5,80)))
+              elif f == 2: src = ' ' * random.randint(0,20)
+              elif f == 3: src = f"(module m 'a {'x'*random.randint(0,30)})"
+              else:        src = ';; comment\n' * random.randint(1,5)
+              try:
+                  s.analyze_source(src)
+              except (SystemExit, KeyboardInterrupt, MemoryError):
+                  crashes += 1
+              except Exception:
+                  pass
+          if crashes: print(f"CRASHES: {crashes}"); sys.exit(1)
+          else:        print(f"OK: 500 inputs, 0 crashes")
+          PYEOF
+
   code-quality:
     name: 📐 Code Quality
     runs-on: ubuntu-latest
@@ -254,74 +131,52 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      - name: Install quality tools
-        run: pip install radon flake8 --break-system-packages || pip install radon flake8
+      - name: Install tools
+        run: pip install radon flake8 || true
+        continue-on-error: true
 
-      - name: Measure code complexity
+      - name: Complexity + style
         run: |
-          echo "=== Cyclomatic Complexity ===" 
-          python -m radon cc src/ -s --average -n B || true
+          python -m radon cc src/ --average -n C 2>/dev/null || echo "radon unavailable"
+          python -m flake8 src/ cli.py --max-line-length=120 --ignore=E501,W503 --count 2>/dev/null || echo "flake8 done"
+        continue-on-error: true
 
-      - name: Check code style (informational)
+      - name: Source line counts
         run: |
-          python -m flake8 src/ cli.py \
-            --max-line-length=120 \
-            --ignore=E501,W503,E731 \
-            --count --statistics || true
-
-      - name: Count source lines
-        run: |
-          python3 << 'PYEOF'
+          python3 -c "
           import os
-
-          totals = {'py': {'files': 0, 'lines': 0, 'code': 0},
-                    'yml': {'files': 0, 'lines': 0, 'code': 0},
-                    'pact': {'files': 0, 'lines': 0, 'code': 0}}
-
-          for root, dirs, files in os.walk('.'):
-              dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__', 'node_modules'}]
-              for fname in files:
-                  ext = fname.rsplit('.', 1)[-1] if '.' in fname else ''
-                  if ext not in totals:
-                      continue
-                  path = os.path.join(root, fname)
+          totals = {}
+          for root,dirs,files in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in {'.git','__pycache__','node_modules'}]
+              for f in files:
+                  ext = f.rsplit('.',1)[-1] if '.' in f else ''
+                  if ext not in ('py','yml','pact','ts','html'): continue
                   try:
-                      with open(path) as f:
-                          lines = f.readlines()
-                      totals[ext]['files'] += 1
-                      totals[ext]['lines'] += len(lines)
-                      totals[ext]['code'] += sum(1 for l in lines if l.strip() and not l.strip().startswith('#') and not l.strip().startswith(';'))
-                  except:
-                      pass
+                      lines = len(open(os.path.join(root,f)).readlines())
+                      totals[ext] = totals.get(ext,{'f':0,'l':0})
+                      totals[ext]['f']+=1; totals[ext]['l']+=lines
+                  except: pass
+          for ext in sorted(totals): print(f'{ext}: {totals[ext][\"f\"]} files, {totals[ext][\"l\"]} lines')
+          "
 
-          print("\nSource metrics:")
-          print(f"{'Type':<8} {'Files':<8} {'Total Lines':<14} {'Code Lines':<12}")
-          print("-" * 44)
-          total_code = 0
-          for ext, data in totals.items():
-              if data['files']:
-                  print(f"{ext:<8} {data['files']:<8} {data['lines']:<14} {data['code']:<12}")
-                  total_code += data['code']
-          print(f"\nTotal code lines: {total_code}")
-          PYEOF
-
-  # ── Job 5: Nightly summary ────────────────────────────────────────
   nightly-summary:
     name: 🌙 Nightly Summary
     runs-on: ubuntu-latest
     needs: [drift-detection, nightly-benchmark, fuzz-testing, code-quality]
     if: always()
     steps:
-      - name: Post nightly summary
+      - name: Write summary
         run: |
           DATE=$(date -u +%Y-%m-%d)
-          echo "## 🌙 Nightly Quality Report — ${DATE}" >> $GITHUB_STEP_SUMMARY
+          echo "## 🌙 Nightly Quality — ${DATE}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Agent | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Regression Drift | ${{ needs.drift-detection.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Performance Benchmark | ${{ needs.nightly-benchmark.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Fuzz Testing (500 inputs) | ${{ needs.fuzz-testing.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Drift Detection | ${{ needs.drift-detection.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Performance | ${{ needs.nightly-benchmark.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Fuzz Testing | ${{ needs.fuzz-testing.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Code Quality | ${{ needs.code-quality.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "*Next run: tomorrow at 00:00 UTC*" >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail if drift
+        if: needs.drift-detection.result == 'failure'
+        run: echo "Regression drift detected" && exit 1

@@ -141,13 +141,24 @@ def main():
     else:
         if args.format == "json":
             output = json.dumps([r.report for r in results], indent=2)
+        elif args.format == "sarif":
+            # Merge all runs into a single valid SARIF document
+            import json as _json
+            all_runs = []
+            first = None
+            for r in results:
+                sarif_obj = _json.loads(r.as_sarif())
+                if first is None:
+                    first = sarif_obj
+                all_runs.extend(sarif_obj.get("runs", []))
+            if first:
+                first["runs"] = all_runs
+            output = _json.dumps(first, indent=2) if first else "{}"
         else:
             parts = []
             for r in results:
                 if args.format == "markdown":
                     parts.append(r.as_markdown())
-                elif args.format == "sarif":
-                    parts.append(r.as_sarif())
                 else:
                     parts.append(r.as_cli(color=not args.no_color))
             output = "\n\n".join(parts)
